@@ -1,0 +1,142 @@
+import argparse
+import json
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+import xgboost as xgb
+# OpenStudio-SDK Python bindings
+import openstudio
+
+class SurrogateModel:
+    """
+    Wrapper for XGBoost surrogate thermal model.
+    """
+    def __init__(self, model_path=None):
+        if model_path:
+            self.model = xgb.Booster()
+            self.model.load_model(model_path)
+        else:
+            self.model = None
+
+    def train(self, data_csv, features, target='EUI'):
+        df = pd.read_csv(data_csv)
+        dtrain = xgb.DMatrix(df[features], label=df[target])
+        params = {
+            'objective': 'reg:squarederror',
+            'eval_metric': 'rmse'
+        }
+        self.model = xgb.train(params, dtrain, num_boost_round=100)
+        self.model.save_model('xgb_model.json')
+        print("Surrogate model trained and saved to xgb_model.json")
+
+    def predict(self, X):
+        dmat = xgb.DMatrix(X)
+        return self.model.predict(dmat)
+
+class SimulationEngine:
+    """
+    Thermal simulation via OpenStudio.
+    Stub for single-zone analysis; users should expand per project.
+    """
+    @staticmethod
+    def simulate(dwg_path, climate_csv):
+        # Load a model from DWG or OSM
+        # For stub purposes, return a constant adjustment
+        print(f"Simulating full physics model for {dwg_path} with climate {climate_csv}...")
+        # Placeholder for actual OpenStudio workflow
+        return 0.0  # dummy delta EUI
+
+class GeneticOptimizer:
+    """
+    Genetic algorithm using PyTorch tensors.
+    Parameters: width, length, height (in meters).
+    """
+    def __init__(self, pop_size=20, generations=100, mutation_rate=0.1):
+        self.pop_size = pop_size
+        self.generations = generations
+        self.mutation_rate = mutation_rate
+
+    def initialize(self):
+        # Random parameters: [width, length, height]
+        return torch.rand(self.pop_size, 3) * torch.tensor([50.0, 50.0, 20.0])
+
+    def fitness(self, population, surrogate: SurrogateModel):
+        # Convert to numpy for surrogate prediction
+        X = population.detach().numpy()
+        preds = surrogate.predict(X)
+        # Lower EUI is better, so fitness is negative EUI
+        return -torch.tensor(preds, dtype=torch.float32)
+
+    def select(self, pop, fitness_scores):
+        # Tournament selection
+        selected = []
+        for _ in range(self.pop_size):
+            i, j = np.random.choice(self.pop_size, 2, replace=False)
+            winner = pop[i] if fitness_scores[i] > fitness_scores[j] else pop[j]
+            selected.append(winner)
+        return torch.stack(selected)
+
+    def crossover(self, parents):
+        # Single-point crossover
+        children = []
+        for i in range(0, self.pop_size, 2):
+            p1, p2 = parents[i], parents[(i+1) % self.pop_size]
+            cp = np.random.randint(1, 3)
+            child1 = torch.cat((p1[:cp], p2[cp:]))
+            child2 = torch.cat((p2[:cp], p1[cp:]))
+            children += [child1, child2]
+        return torch.stack(children)
+
+    def mutate(self, population):
+        for i in range(self.pop_size):
+            if np.random.rand() < self.mutation_rate:
+                gene = np.random.randint(3)
+                population[i, gene] += torch.randn(1) * 5.0
+        return population.clamp(min=0.0)
+
+    def evolve(self, surrogate: SurrogateModel):
+        pop = self.initialize()
+        for g in range(self.generations):
+            fit = self.fitness(pop, surrogate)
+            parents = self.select(pop, fit)
+            children = self.crossover(parents)
+            pop = self.mutate(children)
+            if g % 10 == 0:
+                best = pop[fit.argmax()]
+                print(f"Gen {g}: best params {best.numpy()}, EUI {-fit.max().item():.2f}")
+        # Final evaluation
+        fit = self.fitness(pop, surrogate)
+        sorted_idx = torch.argsort(fit, descending=True)
+        top = pop[sorted_idx][:5].numpy()
+        top_eui = -fit[sorted_idx][:5].numpy()
+        df = pd.DataFrame(top, columns=['width','length','height'])
+        df['predicted_EUI'] = top_eui
+        df.to_csv('best_designs.csv', index=False)
+        print("Top designs saved to best_designs.csv")
+
+def main():
+    parser = argparse.ArgumentParser(description="AI Design Engine")
+    parser.add_argument('--data', required=True, help='CSV training data')
+    parser.add_argument('--features', nargs=3, default=['width','length','height'],
+                        help='Feature names for surrogate model')
+    parser.add_argument('--climate', required=True, help='Climate CSV file')
+    parser.add_argument('--dwg', default=None, help='DWG/OSM file path')
+    parser.add_argument('--runs', type=int, default=100, help='GA generations')
+    args = parser.parse_args()
+
+    # Train surrogate model
+    surrogate = SurrogateModel()
+    surrogate.train(args.data, args.features)
+
+    # Full simulation (optional)
+    if args.dwg:
+        delta = SimulationEngine.simulate(args.dwg, args.climate)
+        print(f"Simulation-based EUI delta: {delta}")
+
+    # Run genetic algorithm
+    ga = GeneticOptimizer(pop_size=30, generations=args.runs)
+    ga.evolve(surrogate)
+
+if __name__ == '__main__':
+    main()
